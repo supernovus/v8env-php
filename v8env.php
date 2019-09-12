@@ -11,16 +11,18 @@ namespace V8Env;
 class Setting
 {
   /**
-   * If this is set to true, we will add a 'loadScript' function to the
-   * '_environment' PHP context property.
-   */
-  public $addLoader = false;
-
-  /**
-   * If this and $addLoader are both true, we will add a 'require' global
-   * function that uses the 'loadScript' function to load scripts.
+   * If this is true or a string, the addRequire() call will be called
+   * automatically on the makeContext() call, using the context name from that.
    */
   public $addRequire = false;
+
+  /**
+   * If this is set to true or a Closure, the Context::addLoader() call will
+   * be called automatically on the Context::makeV8() or Context::makeEnv()
+   * calls. If it's true, the default addLoader will be added. If it's a
+   * Closure, that will be used as the addLoader call.
+   */
+  public $addLoader = false;
 
   protected $libScripts = [];
 
@@ -40,6 +42,7 @@ class Setting
       $identifier = $string;
     }
     $this->libScripts[$identifier] = $string;
+    return $this;
   }
 
   /**
@@ -50,6 +53,23 @@ class Setting
   public function addFile ($filename)
   {
     $this->libScripts[$identifier] = file_get_contents($filename);
+    return $this;
+  }
+
+  /**
+   * Add a global function to call the 'loadScript' environment function.
+   *
+   * Instead of calling this manually, you can also just set the
+   * $addRequire property to true for the default name, or to a string
+   * to override the function name. In that case the context name will be
+   * taken from the makeContext() function.
+   *
+   * @param string $funcName  The name for the function (default 'require').
+   * @param string $contextName  The name for the context (default 'php').
+   */
+  public function addRequire ($funcName='require', $contextName='php')
+  {
+    return $this->addString("\nfunction $funcName (name) { return global.$contextName._environment.loadScript(name); }\n", $funcName);
   }
 
   /**
@@ -60,6 +80,7 @@ class Setting
   public function removeLib ($identifier)
   {
     unset($this->libScripts[$identifier]);
+    return $this;
   }
 
   /**
@@ -67,15 +88,24 @@ class Setting
    *
    * @param string $contextName  Will be used as the PHP context object in V8.
    *
+   * Defaults to 'php' if not specified.
+   *
    * @return V8Env\Context
    */
-  public function makeContext ($contextName)
+  public function makeContext ($contextName='php')
   {
-    $libText = implode("\n", $this->libScripts);
-    if ($this->addLoader && $this->addRequire)
+    if ($this->addRequire)
     {
-      $libText .= "\nfunction require (name) { return global.$contextName._environment.loadScript(name); }\n";
+      if (is_string($this->addRequire))
+      {
+        $this->addRequire($this->addRequire, $contextName);
+      }
+      else
+      {
+        $this->addRequire('require', $contextName);
+      }
     }
+    $libText = implode("\n", $this->libScripts);
     $snapshot = \V8Js::createSnapshot($libText);
     return new Context($this, $contextName, $snapshot);
   }
@@ -91,6 +121,7 @@ class Context
   protected $setting;
   protected $contextName;
   protected $snapshot;
+  protected $envScripts = [];
 
   public function __construct ($setting, $contextName, $snapshot)
   {
@@ -116,18 +147,48 @@ class Context
   }
 
   /**
+   * Add a property to our '_environment' PHP context object.
+   *
+   * If the property is a Closure, when the makeV8() or makeEnv() method
+   * is called, we will make a copy of the Closure bound to the spawned
+   * object. That way you can call $this on any public function calls.
+   */
+  public function __set ($name, $value)
+  {
+    $this->envScripts[$name] = $value;
+  }
+
+  /**
+   * Remove a property from our '_environment' PHP context object.
+   */
+  public function __unset ($name)
+  {
+    unset($this->envScripts[$name]);
+  }
+
+  /**
+   * Get a property from our '_environment' PHP context object.
+   */
+  public function __get ($name)
+  {
+    return $this->envScripts[$name];
+  }
+
+  /**
    * Return a V8Js instance.
    *
-   * Automatically sets the context name, and snapshot, and populates
-   * a special '_environment' property in the PHP context object which contains
-   * useful helper functions.
+   * @param bool $populate  Populate the _environment using the V8Js.
+   *                        Default: true.
    *
    * @return V8Js
    */
-  public function makeV8 ()
+  public function makeV8 ($populate=true)
   {
     $v8 = new \V8Js($this->contextName, [], [], true, $this->snapshot);
-    $this->populateEnvironment($v8);
+    if ($populate)
+    {
+      $this->populateEnvironment($v8);
+    }
     return $v8;
   }
 
@@ -136,25 +197,88 @@ class Context
    *
    * Calls makeV8() and then returns a new Environment instance with it.
    *
+   * @param bool $populate    Populate the _environment using the Environment.
+   *                          Default: true.
+   *                          This is mutually exclusive with $populateV8.
+   * @param bool $populateV8  Populate the _environment using the V8Js.
+   *                          Default: false.
+   *                          This is mutually exclusive with $populate.
+   *
    * @return V8Env\Environment
    */
-  public function makeEnv ()
+  public function makeEnv ($populate=true, $populateV8=false)
   {
-    $v8 = $this->makeV8();
-    return new Environment($this, $v8);
+    if ($populate && $populateV8)
+    {
+      throw new Exception("populate and populateV8 are mutually exclusive");
+    }
+    $v8 = $this->makeV8($populateV8);
+    $env = new Environment($this, $v8);
+    if ($populate)
+    {
+      $this->populateEnvironment($env);
+    }
+    return $env;
   }
 
-  protected function populateEnvironment ($v8)
+  /**
+   * Add a script loader to the environment scripts.
+   * It uses the name 'loadScript' which is used by the 'require()' built-in.
+   *
+   * If the Setting::$addLoader property is set, and this has not been
+   * called manually, it will be called automatically.
+   *
+   * @param Closure $script  The closure script to perform the loading.
+   *
+   * If $script is not a Closure, we will add a default version that uses 
+   * local files. When makeV8() or makeEnv() is called, a copy of the closure
+   * will be bound to the spawned object.
+   */
+  public function addLoader ($script=null)
   {
-    $envlib = [];
-    if ($this->setting->addLoader)
+    if (!($script instanceof \Closure))
     {
-      $envlib['loadScript'] = function ($filename) use ($v8)
+      $script = function ($filename)
       {
-        return $v8->executeString(file_get_contents($filename), $filename);
+        if (is_callable([$this, 'runFile']))
+        {
+          return $this->runFile($filename);
+        }
+        elseif (is_callable([$this, 'executeString']))
+        {
+          return $this->executeString(file_get_contents($filename), $filename);
+        }
+        else
+        {
+          throw new \Exception("Could not find execute method");
+        }
       };
     }
-    $v8->_environment = $envlib;
+    $this->envScripts['loadScript'] = $script;
+    return $this;
+  }
+
+  protected function populateEnvironment ($obj)
+  {
+    if ($this->setting->addLoader && !isset($this->envScripts['loadScript']))
+    {
+      $this->addLoader($this->setting->addLoader);
+    }
+
+    $env = [];
+    foreach ($this->envScripts as $name => $val)
+    {
+      if ($val instanceof \Closure)
+      {
+        $env[$name] = $val->bindTo($obj);
+      }
+      else
+      {
+        $env[$name] = $val;
+      }
+    }
+
+    $obj->_environment = $env;
   }
 }
 
