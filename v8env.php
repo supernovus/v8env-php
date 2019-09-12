@@ -116,18 +116,31 @@ class Context
   }
 
   /**
-   * Return a Environment instance.
+   * Return a V8Js instance.
    *
    * Automatically sets the context name, and snapshot, and populates
    * a special '_environment' property in the PHP context object which contains
    * useful helper functions.
    *
+   * @return V8Js
+   */
+  public function makeV8 ()
+  {
+    $v8 = new \V8Js($this->contextName, [], [], true, $this->snapshot);
+    $this->populateEnvironment($v8);
+    return $v8;
+  }
+
+  /**
+   * Return a Environment instance.
+   *
+   * Calls makeV8() and then returns a new Environment instance with it.
+   *
    * @return V8Env\Environment
    */
   public function makeEnv ()
   {
-    $v8 = new \V8Js($this->contextName, [], [], true, $this->snapshot);
-    $this->populateEnvironment($v8);
+    $v8 = $this->makeV8();
     return new Environment($this, $v8);
   }
 
@@ -138,7 +151,7 @@ class Context
     {
       $envlib['loadScript'] = function ($filename) use ($v8)
       {
-        return $v8->executeString(file_get_contents($filename));
+        return $v8->executeString(file_get_contents($filename), $filename);
       };
     }
     $v8->_environment = $envlib;
@@ -208,13 +221,13 @@ class Environment
    * @param string $text  The script text you want to run.
    * @param array  $args  Named arguments you want to add.
    */
-  public function runString ($text, $args=[])
+  public function runString ($text, $args=[], $identifier='', $flags=\V8JS::FLAG_NONE, $tl=0, $ml=0)
   {
     foreach ($args as $argname => $argval)
     {
       $this->v8->$argname = $argval;
     }
-    return $this->v8->executeString($text);
+    return $this->v8->executeString($text, $identifier, $flags, $tl, $ml);
   }
 
   /**
@@ -223,8 +236,8 @@ class Environment
    * @param string $filename  The filename of the script to run.
    * @param array  $args      Named arguments you want to add.
    */
-  public function runFile ($filename, $args=[])
+  public function runFile ($filename, $args=[], $flags=\V8JS::FLAG_NONE, $tl=0, $ml=0)
   {
-    return $this->runString(file_get_contents($filename), $args);
+    return $this->runString(file_get_contents($filename), $args, $filename, $flags, $tl, $ml);
   }
 }
