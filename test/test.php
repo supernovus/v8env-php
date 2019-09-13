@@ -2,9 +2,7 @@
 
 require_once '../v8env.php';
 
-$setting = new \V8Env\Setting();
-$setting->addLoader = true;
-$setting->addRequire = true;
+$setting = new \V8Env\Setting(['addLoader'=>true, 'addRequire'=>true]);
 $setting->addFile('lib.js');
 $env = $setting->makeContext('that')->makeEnv();
 

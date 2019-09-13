@@ -11,6 +11,24 @@ namespace V8Env;
 class Setting
 {
   /**
+   * Set this to the default PHP context object name. The V8Js will add a
+   * global property with this name that contains any variables added to it
+   * so they can be accessed from Javascript.
+   *
+   * This can be overridden in individual Context instances.
+   */
+  public $phpName = 'php';
+
+  /**
+   * Set this to the default name you want the property name you want to be
+   * added to the PHP context object within the V8 instance for storing
+   * extensions for special purposes.
+   *
+   * This can be overridden in individual Context instances.
+   */
+  public $extName = '_ext';
+
+  /**
    * If this is true or a string, the addRequire() call will be called
    * automatically on the makeContext() call, using the context name from that.
    */
@@ -19,12 +37,30 @@ class Setting
   /**
    * If this is set to true or a Closure, the Context::addLoader() call will
    * be called automatically on the Context::makeV8() or Context::makeEnv()
-   * calls. If it's true, the default addLoader will be added. If it's a
-   * Closure, that will be used as the addLoader call.
+   * calls. If it's true, the default loadScript will be added. If it's a
+   * Closure, that will be used as the loadScript call.
    */
   public $addLoader = false;
 
   protected $libScripts = [];
+
+  /**
+   * Build a Setting object.
+   *
+   * @param array $opts  Named options for any of the class properties.
+   *
+   */
+  public function __construct ($opts=[])
+  {
+    $props = array_keys(get_object_vars($this));
+    foreach ($props as $prop)
+    {
+      if (isset($opts[$prop]))
+      {
+        $this->$prop = $opts[$prop];
+      }
+    }
+  }
 
   /**
    * Add a library from a string.
@@ -57,19 +93,27 @@ class Setting
   }
 
   /**
-   * Add a global function to call the 'loadScript' environment function.
+   * Add a global function to call the 'loadScript' extension function.
    *
    * Instead of calling this manually, you can also just set the
    * $addRequire property to true for the default name, or to a string
    * to override the function name. In that case the context name will be
    * taken from the makeContext() function.
    *
-   * @param string $funcName  The name for the function (default 'require').
-   * @param string $contextName  The name for the context (default 'php').
+   * @param string $funcName     The name for the function.
+   *                             Defaults to 'require'.
+   * @param string $phpName      The name for the PHP context object.
+   *                             Defaults to $this->phpName if not specified.
+   * @param string $extName      The name for the extension object.
+   *                             Defaults to $this->extName if not specified.
+   *
    */
-  public function addRequire ($funcName='require', $contextName='php')
+  public function addRequire ($funcName=null, $phpName=null, $extName=null)
   {
-    return $this->addString("\nfunction $funcName (name) { return global.$contextName._environment.loadScript(name); }\n", $funcName);
+    if (!is_string($funcName)) $funcName = 'require';
+    if (!is_string($phpName)) $phpName = $this->phpName;
+    if (!is_string($extName)) $extName = $this->extName;
+    return $this->addString("\nfunction $funcName (name) { return global.$phpName.$extName.loadScript(name); }\n", $funcName);
   }
 
   /**
@@ -86,28 +130,26 @@ class Setting
   /**
    * Create a Context instance.
    *
-   * @param string $contextName  Will be used as the PHP context object in V8.
-   *
-   * Defaults to 'php' if not specified.
+   * @param string $phpName      Will be used as the PHP context object in V8.
+   *                             Defaults to $this->phpName if not specified.
+   * @param string $extName      Will be used as the extension object name.
+   *                             Defaults to $this->extName if not specified.
    *
    * @return V8Env\Context
    */
-  public function makeContext ($contextName='php')
+  public function makeContext ($phpName=null, $extName=null)
   {
+    if (is_null($phpName)) $phpName = $this->phpName;
+    if (is_null($extName)) $extName = $this->extName;
+
     if ($this->addRequire)
     {
-      if (is_string($this->addRequire))
-      {
-        $this->addRequire($this->addRequire, $contextName);
-      }
-      else
-      {
-        $this->addRequire('require', $contextName);
-      }
+      $this->addRequire($this->addRequire, $phpName, $extName);
     }
+
     $libText = implode("\n", $this->libScripts);
     $snapshot = \V8Js::createSnapshot($libText);
-    return new Context($this, $contextName, $snapshot);
+    return new Context($this, $phpName, $extName, $snapshot);
   }
 }
 
@@ -119,14 +161,16 @@ class Setting
 class Context
 {
   protected $setting;
-  protected $contextName;
+  protected $phpName;
+  protected $extName;
   protected $snapshot;
-  protected $envScripts = [];
+  protected $extensions = [];
 
-  public function __construct ($setting, $contextName, $snapshot)
+  public function __construct ($setting, $phpName, $extName, $snapshot)
   {
     $this->setting = $setting;
-    $this->contextName = $contextName;
+    $this->phpName = $phpName;
+    $this->extName = $extName;
     $this->snapshot = $snapshot;
   }
 
@@ -146,8 +190,23 @@ class Context
     return $this->snapshot;
   }
 
+  public function getPhpName ()
+  {
+    return $this->phpName;
+  }
+
+  public function getExtName ()
+  {
+    return $this->extName;
+  }
+
   /**
-   * Add a property to our '_environment' PHP context object.
+   * Add an extension to our PHP context object.
+   *
+   * These are NOT V8Js extensions (which are deprecated), they are simply
+   * PHP objects, properties, or functions which can be used for internal
+   * library purposes. They are put into a child property within the global
+   * PHP context object to keep them separate from user added properties.
    *
    * If the property is a Closure, when the makeV8() or makeEnv() method
    * is called, we will make a copy of the Closure bound to the spawned
@@ -155,39 +214,39 @@ class Context
    */
   public function __set ($name, $value)
   {
-    $this->envScripts[$name] = $value;
+    $this->extensions[$name] = $value;
   }
 
   /**
-   * Remove a property from our '_environment' PHP context object.
+   * Remove an extension property.
    */
   public function __unset ($name)
   {
-    unset($this->envScripts[$name]);
+    unset($this->extensions[$name]);
   }
 
   /**
-   * Get a property from our '_environment' PHP context object.
+   * Get an extension property.
    */
   public function __get ($name)
   {
-    return $this->envScripts[$name];
+    return $this->extensions[$name];
   }
 
   /**
    * Return a V8Js instance.
    *
-   * @param bool $populate  Populate the _environment using the V8Js.
+   * @param bool $extend    Add extensions to the V8Js PHP object.
    *                        Default: true.
    *
    * @return V8Js
    */
-  public function makeV8 ($populate=true)
+  public function makeV8 ($extend=true)
   {
-    $v8 = new \V8Js($this->contextName, [], [], true, $this->snapshot);
-    if ($populate)
+    $v8 = new \V8Js($this->phpName, [], [], true, $this->snapshot);
+    if ($extend)
     {
-      $this->populateEnvironment($v8);
+      $this->addExtensions($v8);
     }
     return $v8;
   }
@@ -197,32 +256,33 @@ class Context
    *
    * Calls makeV8() and then returns a new Environment instance with it.
    *
-   * @param bool $populate    Populate the _environment using the Environment.
+   * @param bool $extend      Add extensions to the Environment instance.
    *                          Default: true.
-   *                          This is mutually exclusive with $populateV8.
-   * @param bool $populateV8  Populate the _environment using the V8Js.
+   *                          This is mutually exclusive with $extendV8.
+   * @param bool $extendV8    Add extensions to the V8Js instance.
    *                          Default: false.
-   *                          This is mutually exclusive with $populate.
+   *                          This is mutually exclusive with $extend.
    *
    * @return V8Env\Environment
    */
-  public function makeEnv ($populate=true, $populateV8=false)
+  public function makeEnv ($extend=true, $extendV8=false)
   {
-    if ($populate && $populateV8)
+    if ($extend && $extendV8)
     {
-      throw new Exception("populate and populateV8 are mutually exclusive");
+      throw new Exception("extend and extendV8 are mutually exclusive");
     }
-    $v8 = $this->makeV8($populateV8);
+    $v8 = $this->makeV8($extendV8);
     $env = new Environment($this, $v8);
-    if ($populate)
+    if ($extend)
     {
-      $this->populateEnvironment($env);
+      $this->addExtensions($env);
     }
     return $env;
   }
 
   /**
-   * Add a script loader to the environment scripts.
+   * Add a script loader extension property.
+   *
    * It uses the name 'loadScript' which is used by the 'require()' built-in.
    *
    * If the Setting::$addLoader property is set, and this has not been
@@ -254,19 +314,24 @@ class Context
         }
       };
     }
-    $this->envScripts['loadScript'] = $script;
+    $this->extensions['loadScript'] = $script;
     return $this;
   }
 
-  protected function populateEnvironment ($obj)
+  protected function addExtensions ($obj)
   {
-    if ($this->setting->addLoader && !isset($this->envScripts['loadScript']))
+    if ($this->setting->addLoader && !isset($this->extensions['loadScript']))
     {
       $this->addLoader($this->setting->addLoader);
     }
 
+    if (count($this->extensions) == 0)
+    { // No extensions, we won't do anything.
+      return;
+    }
+
     $env = [];
-    foreach ($this->envScripts as $name => $val)
+    foreach ($this->extensions as $name => $val)
     {
       if ($val instanceof \Closure)
       {
@@ -278,7 +343,8 @@ class Context
       }
     }
 
-    $obj->_environment = $env;
+    $extName = $this->extName;
+    $obj->$extName = $env;
   }
 }
 
@@ -320,6 +386,11 @@ class Environment
    */
   public function __set ($name, $val)
   {
+    $extName = $this->context->getExtName();
+    if ($name == $extName && isset($this->v8->$name))
+    {
+      throw new \Exception("Cannot override '$extName' property");
+    }
     $this->v8->$name = $val;
   }
 
@@ -336,6 +407,11 @@ class Environment
    */
   public function __unset ($name)
   {
+    $extName = $this->context->getExtName();
+    if ($name == $extName)
+    {
+      throw new \Exception("Cannot unset '$extName' property");
+    }
     unset($this->v8->$name);
   }
 
